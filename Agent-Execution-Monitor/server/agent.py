@@ -222,7 +222,7 @@ def proc_snapshot():
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 argv = f.read().replace(b"\x00", b" ").decode(
                     "utf-8", "replace").strip()
-            comm = data[data.index("(") + 1:rp[0]]
+            comm = data[data.index("(") + 1:data.rindex(")")]
             procs[pid] = {"ppid": ppid, "argv": argv or f"[{comm}]"}
             m = SSHD_SESSION_RE.search(argv)
             if m:
@@ -383,6 +383,7 @@ class ServerAgent:
         self.session_span = new_id("span")
         self.pid_spans = {}
         self.seen_pids = {}
+        self.baselined = False
         self.ssh_sessions = {}       # pid -> argv 描述
         self.seen_conns = set()
         self.file_baseline = None
@@ -458,10 +459,11 @@ class ServerAgent:
                 self._print(f"🔒 ssh.session.close {desc}")
 
         tree = tree_from(procs, set(self.ssh_sessions))
-        if not self.seen_pids and tree:
+        if not self.baselined and tree:
             for pid in sorted(tree):
                 self.seen_pids[pid] = procs[pid]["argv"]
                 self.proc_span(pid, self.seen_pids[pid])
+            self.baselined = True
             self._print(f"  进程基线：{len(tree)} 个（sshd 会话 {len(self.ssh_sessions)}）")
             return
         for pid in sorted(tree):
@@ -504,7 +506,12 @@ class ServerAgent:
             if key in self.seen_conns:
                 continue
             self.seen_conns.add(key)
-            pk = "local" if _is_local(peer_ip) else "direct"
+            if pid in self.ssh_sessions:
+                pk = "ssh-inbound"   # sshd 会话自身的接入连接，非主动外联
+            elif _is_local(peer_ip):
+                pk = "local"
+            else:
+                pk = "direct"
             span = self.pid_spans.get(pid) or self.proc_span(
                 pid, self.seen_pids.get(pid, ""))
             self.emit(span, self.session_span, "net.connect",
@@ -516,7 +523,7 @@ class ServerAgent:
                            "peer_kind": pk},
                        "result_summary": {}})
             self._print(f"🌐 net.connect   pid{pid} → {peer_ip}:{peer_port} "
-                        f"[{'本地' if pk == 'local' else '⚠️ 外联'}]")
+                        f"[{'SSH接入' if pk == 'ssh-inbound' else '本地' if pk == 'local' else '⚠️ 外联'}]")
 
     def poll_files(self):
         cur = scan_files(self.watch_roots)
