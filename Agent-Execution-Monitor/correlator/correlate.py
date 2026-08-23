@@ -20,11 +20,18 @@ from trace import canonical_core, chain_hash, HASHED_FIELDS
 ICON = {
     "trace.begin": "◆", "user_request": "👤", "model.turn": "🧠",
     "tool.call": "🔧", "tool.result": "↩️", "fs.read": "📄", "fs.write": "✍️",
-    "process.exec": "⚡", "net.connect": "🌐", "approval": "✅",
-    "git.diff": "🔀", "fs.snapshot": "📸", "final_response": "🏁",
+    "fs.create": "🆕", "fs.delete": "🗑️",
+    "process.exec": "⚡", "process.spawn": "🐣", "process.exit": "💀",
+    "process.span": "🧩",
+    "net.connect": "🌐", "net.listen": "🔌",
+    "approval": "✅", "git.diff": "🔀", "fs.snapshot": "📸",
+    "final_response": "🏁", "trace.end": "◇",
+    "ssh.session.open": "🔓", "ssh.session.close": "🔒",
+    "session.heartbeat": "💓",
 }
 SOURCE_TAG = {"agent_runtime": "语义", "tool_proxy": "工具", "network": "系统",
-              "git": "系统", "kernel": "系统"}
+              "git": "系统", "kernel": "系统", "kiro_observer": "被动",
+              "server_agent": "服务器"}
 
 
 def load_events(path: str) -> list:
@@ -122,50 +129,95 @@ def render_table(events: list, alerts: list) -> str:
 
 
 def verify_chain(events: list) -> dict:
-    """验证哈希链完整性（Beats 只透传、不改哈希覆盖字段时应当全部通过）。"""
-    prev = "GENESIS"
-    bad = []
-    for ev in sorted(events, key=lambda e: e.get("timestamp", "")):
-        # 事件文件内的顺序才是链序：无法从时间严格恢复，改为按写入顺序验证
-        pass
-    # 用文件原始顺序（load_events 已保持顺序）
-    prev = "GENESIS"
+    """验证哈希链完整性（Beats 只透传、不改哈希覆盖字段时应当全部通过）。
+
+    多源合并：按 trace_id 分组各自验证（本地观察器与服务器采集端是两条独立链）。
+    """
+    by_trace = {}
     for ev in events:
-        e = ev.get("evidence") or {}
-        if e.get("prev_hash") != prev or chain_hash(prev, ev) != e.get("hash"):
-            bad.append(ev.get("span_id"))
-            prev = e.get("hash") or prev  # 链断后继续找头
-            continue
-        prev = e["hash"]
-    return {"ok": len(bad) == 0, "broken_at": bad}
+        by_trace.setdefault(ev.get("trace_id", "?"), []).append(ev)
+    bad, per_trace = [], {}
+    for tid, evs in by_trace.items():
+        prev = "GENESIS"
+        t_bad = []
+        for ev in evs:  # 文件原始顺序即链序（load_events 已保持顺序）
+            e = ev.get("evidence") or {}
+            if e.get("prev_hash") != prev or chain_hash(prev, ev) != e.get("hash"):
+                t_bad.append(ev.get("span_id"))
+                prev = e.get("hash") or prev  # 链断后继续找头
+                continue
+            prev = e["hash"]
+        per_trace[tid] = {"ok": not t_bad, "broken_at": t_bad}
+        bad.extend(t_bad)
+    return {"ok": len(bad) == 0, "broken_at": bad, "per_trace": per_trace}
 
 
 def context_from(events: list) -> dict:
+    """跨多个 trace.begin 合并上下文（本地 + 服务器多源）。"""
+    ctx = {"workspace_root": None, "net_allowlist": [],
+           "task": None, "hosts": []}
     for ev in events:
         if ev.get("event_type") == "trace.begin":
             arg = (ev.get("action") or {}).get("arguments_redacted") or {}
-            return {"workspace_root": arg.get("workspace_root"),
-                    "net_allowlist": arg.get("net_allowlist", []),
-                    "task": arg.get("task")}
-    return {}
+            host = (ev.get("actor") or {}).get("name") or \
+                (ev.get("actor") or {}).get("vendor")
+            if host and host not in ctx["hosts"]:
+                ctx["hosts"].append(host)
+            if ctx["workspace_root"] is None:
+                ctx["workspace_root"] = arg.get("workspace_root")
+            if not ctx["net_allowlist"] and arg.get("net_allowlist"):
+                ctx["net_allowlist"] = arg.get("net_allowlist")
+            if ctx["task"] is None:
+                ctx["task"] = arg.get("task")
+    return ctx
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
+    ap.add_argument("--input", required=True,
+                    help="NDJSON 路径，多个用逗号分隔（本地+服务器多源合并）")
     ap.add_argument("--out", default="output")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    events = load_events(args.input)
+    # 多源合并：逗号分隔输入，各文件保持原始链序（分链验证）
+    events = []
+    for path in args.input.split(","):
+        path = path.strip()
+        if path:
+            events.extend(load_events(path))
     if not events:
         print("no events found", file=sys.stderr)
         sys.exit(1)
-    trace_id = events[0]["trace_id"]
+    trace_ids = []
+    for ev in events:
+        t = ev.get("trace_id")
+        if t and t not in trace_ids:
+            trace_ids.append(t)
+    trace_id = trace_ids[0]
     ctx = context_from(events)
 
     alerts = rules_mod.evaluate(events, ctx)
     integrity = verify_chain(events)
+
+    # 合并实时告警（观察器/服务器端内容嗅探产生的 <trace>_alerts.ndjson）
+    for path in args.input.split(","):
+        path = path.strip()
+        if not path:
+            continue
+        ap = path[:-len(".ndjson")] + "_alerts.ndjson" \
+            if path.endswith(".ndjson") else path + "_alerts"
+        if os.path.exists(ap):
+            with open(ap, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            a = json.loads(line)
+                            if a not in alerts:
+                                alerts.append(a)
+                        except json.JSONDecodeError:
+                            continue
 
     tree = render_tree(events, alerts)
     table = render_table(events, alerts)
@@ -174,10 +226,13 @@ def main():
         counts[ev["event_type"]] = counts.get(ev["event_type"], 0) + 1
 
     md = [
-        f"# Agent 执行链时间轴 — `{trace_id}`",
+        f"# Agent 执行链时间轴 — `{trace_id}`"
+        + (f"（+{len(trace_ids) - 1} 个关联源：{', '.join(trace_ids[1:])}）"
+           if len(trace_ids) > 1 else ""),
         "",
         f"- 任务：{ctx.get('task')}",
         f"- 工作区：{ctx.get('workspace_root')}",
+        f"- 监视主机：{', '.join(ctx.get('hosts') or []) or '—'}",
         f"- 事件总数：{len(events)}（{counts}）",
         f"- 告警：{len(alerts)} 条；证据链校验：{'✅ 完整' if integrity['ok'] else '❌ 断裂于 ' + str(integrity['broken_at'])}",
         "",

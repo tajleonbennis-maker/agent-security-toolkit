@@ -104,6 +104,21 @@ Kibana 中按 `trace.id` 过滤即可看到一次任务的完整执行链。
 - 证据包导出后可用 `python3 correlator/evidence.py verify <pkg>` 验证未被篡改
 - 原始证据（raw stdout/stderr）与展示字段分离；默认脱敏 Authorization/Cookie/API Key/私钥
 
+## 实战：被动监视第三方 AI IDE（Kiro）
+
+对不配合、不经过网关的第三方 Agent（如 Kiro IDE），用 `kiro/observer.py`
+纯系统事实观测：进程树（含终端孙进程）/ TCP 外联 / workspace 文件增删改 +
+实时告警（含文件内容密钥嗅探——明文密码/私钥落盘瞬间报警）。
+
+产品化长期运行（watchdog/launchd 守护 + 断链续写）与**服务器侧采集**
+（Kiro SSH 部署到远端主机后的动作监控）见
+[docs/production.md](docs/production.md)。
+
+```bash
+bash kiro/monitor_kiro.sh /path/to/kiro打开的项目   # 守护模式
+bash server/install.sh root@<被部署服务器>           # 服务器侧视野
+```
+
 ## 目录结构
 
 ```
@@ -111,8 +126,10 @@ runtime/     Agent 模拟运行时 + 工具网关 + 传感器（事件发射层�
 tasks/       演示任务定义（JSON，可插拔到真实 LLM Runtime）
 beats/       Filebeat/Packetbeat 配置 + ES ingest pipeline（采集层）
 correlator/  Span 树重建、时间轴、规则引擎、流量关联、证据包（关联层）
+kiro/        被动观察器 v2 + watchdog + launchd 产品化部署
+server/      服务器端采集器 + 一键部署 + 中央汇集器
 demo/        端到端演示脚本
-docs/        架构文档
+docs/        架构文档 + 产品化部署指南
 ```
 
 ## 研究伦理
