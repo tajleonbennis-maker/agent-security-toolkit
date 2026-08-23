@@ -96,7 +96,69 @@ def _looks_like_tool_call(req_json, resp_json, url: str) -> dict:
 
 
 def _looks_like_llm(url: str, req_json, resp_json) -> bool:
-    return any(k in url for k in ["chat/completions", "messages", "anthropic", "bedrock", "claude"])
+    if any(k in url for k in ["chat/completions", "messages", "anthropic", "bedrock", "claude"]):
+        return True
+    # Kiro / AWS CodeWhisperer 套壳：LLM 请求走 runtime.*.kiro.dev 自有端点。
+    # 排除遥测/管理/下载端点（telemetry/metrics 是 OpenTelemetry 数据，非 LLM）。
+    if "kiro.dev" in url or "codewhisperer" in url:
+        if any(x in url for x in ["telemetry", "management", "download"]):
+            return False
+        return "runtime" in url
+    return False
+
+
+def _extract_kiro_user_message(req_json):
+    """从 Kiro/CodeWhisperer 请求体递归提取用户消息（userInputMessage.content）。"""
+    if isinstance(req_json, dict):
+        uim = req_json.get("userInputMessage")
+        if isinstance(uim, dict) and uim.get("content"):
+            return str(uim["content"])
+        cs = req_json.get("conversationState")
+        if isinstance(cs, dict):
+            cm = cs.get("currentMessage")
+            if isinstance(cm, dict):
+                uim2 = cm.get("userInputMessage")
+                if isinstance(uim2, dict) and uim2.get("content"):
+                    return str(uim2["content"])
+        for v in req_json.values():
+            r = _extract_kiro_user_message(v)
+            if r:
+                return r
+    elif isinstance(req_json, list):
+        for v in req_json:
+            r = _extract_kiro_user_message(v)
+            if r:
+                return r
+    return None
+
+
+def _extract_kiro_activities(req_json):
+    """从 Kiro payload activity 数组提取 (assistant 文本列表, 工具调用列表)。
+
+    返回 (texts, tools)，其中 tools 每项 {tool_name, arguments, command}。
+    """
+    texts, tools = [], []
+
+    def walk(node):
+        if isinstance(node, dict):
+            at = node.get("activityType")
+            c = node.get("content")
+            if at == "text" and isinstance(c, dict) and c.get("content"):
+                texts.append(str(c["content"]))
+            elif at == "toolUse" and isinstance(c, dict):
+                tool_name = c.get("toolName") or c.get("actionType") or "unknown"
+                args = c.get("args") or {}
+                command = args.get("command") if isinstance(args, dict) else None
+                tools.append({"tool_name": tool_name, "arguments": args,
+                              "command": command})
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(req_json)
+    return texts, tools
 
 
 def _extract_messages(req_json, resp_json):
@@ -172,52 +234,83 @@ class AgentTrafficAddon:
             pass
 
         if req_json:
-            tool = _looks_like_tool_call(req_json, {}, flow.request.pretty_url)
-            if tool:
-                tool_ev = _make_event(
-                    "tool.invoke",
-                    f"{span_id}_tool",
-                    span_id,
-                    actor={"type": "agent", "name": "Kiro"},
-                    action={
-                        "name": tool["tool_name"],
-                        "arguments_redacted": tool["arguments"],
-                        "result_summary": {},
-                        "summary": f"调用工具 {tool['tool_name']}",
-                    },
-                )
-                _post(tool_ev)
+            kiro_texts, kiro_tools = _extract_kiro_activities(req_json)
+            kiro_msg = _extract_kiro_user_message(req_json)
+            is_kiro = bool(kiro_texts or kiro_tools or kiro_msg)
 
-            if _looks_like_llm(flow.request.pretty_url, req_json, {}):
-                llm_ev = _make_event(
-                    "llm.request",
-                    f"{span_id}_llm",
-                    span_id,
-                    actor={"type": "agent", "name": "Kiro"},
-                    action={
-                        "name": "chat_completion",
-                        "arguments_redacted": req_json,
-                        "result_summary": {},
-                        "summary": f"LLM request to {host}",
-                    },
-                )
-                _post(llm_ev)
-                # 提取并广播用户最新一轮消息
-                for m in _extract_messages(req_json, {}):
-                    if m["role"] in ("user", "human"):
-                        conv_ev = _make_event(
-                            "conversation.user",
-                            f"{span_id}_conv_user",
-                            f"{span_id}_llm",
-                            actor={"type": "user", "name": "operator"},
-                            action={
-                                "name": "user_message",
-                                "arguments_redacted": {"role": m["role"], "preview": m["content"][:200]},
+            if is_kiro:
+                # —— Kiro / AWS CodeWhisperer 套壳格式（MCP activity 数组）——
+                if _looks_like_llm(flow.request.pretty_url, req_json, {}):
+                    llm_ev = _make_event(
+                        "llm.request", f"{span_id}_llm", span_id,
+                        actor={"type": "agent", "name": "Kiro"},
+                        action={"name": "chat_completion",
+                                "arguments_redacted": req_json,
                                 "result_summary": {},
-                                "summary": f"User → Kiro: {m['content'][:120]}",
-                            },
-                        )
-                        _post(conv_ev)
+                                "summary": f"LLM request to {host}"})
+                    _post(llm_ev)
+                if kiro_msg:
+                    conv_ev = _make_event(
+                        "conversation.user", f"{span_id}_conv_user", f"{span_id}_llm",
+                        actor={"type": "user", "name": "operator"},
+                        action={"name": "user_message",
+                                "arguments_redacted": {"role": "user", "preview": kiro_msg[:200]},
+                                "result_summary": {},
+                                "summary": f"User → Kiro: {kiro_msg[:120]}"})
+                    _post(conv_ev)
+                for t in kiro_texts:
+                    conv_ev = _make_event(
+                        "conversation.assistant", f"{span_id}_conv_asst", span_id,
+                        actor={"type": "agent", "name": "Kiro"},
+                        action={"name": "assistant_message",
+                                "arguments_redacted": {"role": "assistant", "preview": t[:200]},
+                                "result_summary": {},
+                                "summary": f"Kiro → User: {t[:120]}"})
+                    _post(conv_ev)
+                for t in kiro_tools:
+                    args = {"command": t["command"]} if t["command"] else t["arguments"]
+                    tool_ev = _make_event(
+                        "tool.invoke", f"{span_id}_tool_{t['tool_name']}", span_id,
+                        actor={"type": "agent", "name": "Kiro"},
+                        action={"name": t["tool_name"],
+                                "arguments_redacted": args,
+                                "result_summary": {},
+                                "summary": f"调用工具 {t['tool_name']}"
+                                + (f": {t['command'][:80]}" if t["command"] else "")})
+                    _post(tool_ev)
+            else:
+                # —— 标准 OpenAI/Anthropic 格式 ——
+                tool = _looks_like_tool_call(req_json, {}, flow.request.pretty_url)
+                if tool:
+                    tool_ev = _make_event(
+                        "tool.invoke", f"{span_id}_tool", span_id,
+                        actor={"type": "agent", "name": "Kiro"},
+                        action={"name": tool["tool_name"],
+                                "arguments_redacted": tool["arguments"],
+                                "result_summary": {},
+                                "summary": f"调用工具 {tool['tool_name']}"})
+                    _post(tool_ev)
+
+                if _looks_like_llm(flow.request.pretty_url, req_json, {}):
+                    llm_ev = _make_event(
+                        "llm.request", f"{span_id}_llm", span_id,
+                        actor={"type": "agent", "name": "Kiro"},
+                        action={"name": "chat_completion",
+                                "arguments_redacted": req_json,
+                                "result_summary": {},
+                                "summary": f"LLM request to {host}"})
+                    _post(llm_ev)
+                    # 提取并广播用户最新一轮消息
+                    for m in _extract_messages(req_json, {}):
+                        if m["role"] in ("user", "human"):
+                            conv_ev = _make_event(
+                                "conversation.user", f"{span_id}_conv_user", f"{span_id}_llm",
+                                actor={"type": "user", "name": "operator"},
+                                action={"name": "user_message",
+                                        "arguments_redacted": {"role": m["role"], "preview": m["content"][:200]},
+                                        "result_summary": {},
+                                        "summary": f"User → Kiro: {m['content'][:120]}"})
+                            _post(conv_ev)
 
     def response(self, flow: http.HTTPFlow):
         span_id = self.flow_spans.pop(flow.id, _span_id())
