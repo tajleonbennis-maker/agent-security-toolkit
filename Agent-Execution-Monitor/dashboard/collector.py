@@ -315,8 +315,43 @@ def ingest_event(ev: dict, config: dict):
         _broadcast({"kind": "alert", "data": alert})
 
 
+def _load_history(events_dir: str):
+    """启动时从 events 目录加载历史事件，让 BOSS 视图重启后仍有数据。"""
+    evdir = Path(events_dir)
+    if not evdir.is_dir():
+        return
+    loaded = []
+    for fn in sorted(evdir.glob("*.ndjson")):
+        if fn.name.endswith("_alerts.ndjson"):
+            continue
+        try:
+            with open(fn, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                        loaded.append(ev)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+    if not loaded:
+        return
+    loaded.sort(key=lambda e: e.get("timestamp", "") or "")
+    loaded = loaded[-3000:]
+    with LOCK:
+        STATE["events"] = loaded
+        for ev in loaded:
+            et = ev.get("event_type", "unknown")
+            STATE["counters"][et] = STATE["counters"].get(et, 0) + 1
+        STATE["last"] = loaded[-1].get("timestamp") if loaded else None
+
+
 def create_app(events_dir: str, fallback_trace_id: str):
     config = {"events_dir": events_dir, "fallback_trace_id": fallback_trace_id}
+    _load_history(events_dir)
 
     @app.route("/ingest", methods=["POST"])
     def ingest():
@@ -398,6 +433,10 @@ def create_app(events_dir: str, fallback_trace_id: str):
     @app.route("/")
     def index():
         return render_template_string(DASHBOARD_HTML)
+
+    @app.route("/boss")
+    def boss():
+        return render_template_string(BOSS_HTML)
 
     return app
 
@@ -522,6 +561,189 @@ async function refreshState(){
 }
 setInterval(refreshState, 3000);
 refreshState();
+</script>
+</body>
+</html>
+"""
+
+
+BOSS_HTML = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent 使用总览 — BOSS 视图</title>
+<style>
+  :root { --bg:#f2f4f7; --panel:#fff; --text:#1a1f26; --muted:#6b7280; --accent:#2563eb; --red:#dc2626; --orange:#d97706; --green:#16a34a; --purple:#7c3aed; --border:#e5e7eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); }
+  header { background:var(--panel); border-bottom:1px solid var(--border); padding:14px 24px; display:flex; align-items:center; gap:16px; position:sticky; top:0; z-index:10; }
+  h1 { margin:0; font-size:19px; font-weight:600; }
+  .nav { margin-left:auto; display:flex; gap:8px; font-size:13px; }
+  .nav a { text-decoration:none; color:var(--muted); padding:5px 12px; border-radius:8px; }
+  .nav a.active { background:#eef2ff; color:var(--accent); font-weight:600; }
+  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:12px; padding:16px 24px; }
+  .stat { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; }
+  .stat .label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .stat .value { font-size:26px; font-weight:700; }
+  .stat.warn .value { color:var(--red); }
+  main { padding:0 24px 40px; }
+  .task { background:var(--panel); border:1px solid var(--border); border-radius:14px; margin-bottom:16px; overflow:hidden; }
+  .task-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:12px; }
+  .task-head .time { font-size:12px; color:var(--muted); white-space:nowrap; }
+  .task-head .instruction { font-size:15px; font-weight:600; flex:1; }
+  .task-head .risk { font-size:12px; background:#fef2f2; color:var(--red); padding:3px 10px; border-radius:12px; font-weight:600; }
+  .task-body { padding:14px 18px; }
+  .row { display:flex; gap:8px; align-items:flex-start; margin-bottom:10px; font-size:13px; }
+  .row .tag { flex-shrink:0; width:88px; color:var(--muted); font-size:12px; padding-top:1px; }
+  .row .content { flex:1; line-height:1.7; }
+  .chip { display:inline-block; background:#f3f4f6; border:1px solid var(--border); border-radius:6px; padding:1px 8px; margin:2px 3px 2px 0; font-size:12px; font-family:ui-monospace,monospace; }
+  .chip.model { background:#f5f3ff; border-color:#ddd6fe; color:var(--purple); }
+  .chip.tool { background:#eef2ff; border-color:#c7d2fe; color:var(--accent); }
+  .chip.file { background:#f0fdf4; border-color:#bbf7d0; color:var(--green); }
+  .chip.ext { background:#fffbeb; border-color:#fde68a; color:var(--orange); }
+  .chip.read { background:#f0f9ff; border-color:#bae6fd; color:#0369a1; }
+  .risk-section { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:16px 18px; margin-bottom:16px; }
+  .risk-section h2 { margin:0 0 10px; font-size:15px; }
+  .risk-item { font-size:13px; padding:6px 0; border-bottom:1px solid #f5f5f5; }
+  .risk-item:last-child { border-bottom:none; }
+  .risk-item .r1 { color:var(--red); font-weight:600; }
+  .risk-item .r4 { color:var(--orange); font-weight:600; }
+  .empty { text-align:center; color:var(--muted); padding:60px 0; font-size:14px; }
+  @media (max-width:900px) { .stats { grid-template-columns:repeat(3,1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤖 Agent 使用总览</h1>
+  <div class="nav">
+    <a href="/boss" class="active">BOSS 视图</a>
+    <a href="/">原始事件</a>
+  </div>
+</header>
+
+<div class="stats" id="stats"></div>
+<main>
+  <div class="risk-section" id="riskSummary" style="display:none"></div>
+  <div id="tasks"></div>
+</main>
+
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtTime = ts => { if(!ts) return ''; const d=new Date(ts); return isNaN(d)? String(ts).slice(11,19) : d.toLocaleTimeString('zh-CN',{hour12:false}); };
+const isNoiseFs = p => !p || p.includes('Application Support') || p.includes('Library/Caches') || p.includes('.git/objects');
+
+async function load(){
+  const [evRes, alRes] = await Promise.all([
+    fetch('/api/events?limit=3000').then(r=>r.json()),
+    fetch('/api/alerts').then(r=>r.json())
+  ]);
+  const events = Array.isArray(evRes) ? evRes : [];
+  const alerts = Array.isArray(alRes) ? alRes : [];
+  renderStats(events, alerts);
+  renderRisk(alerts);
+  renderTasks(events, alerts);
+}
+
+function renderStats(events, alerts){
+  const instructions = getInstructions(events);
+  const toolCalls = events.filter(e=>e.event_type==='tool.invoke').length;
+  const llmCalls = events.filter(e=>e.event_type==='llm.request').length;
+  const fileOps = events.filter(e=>e.event_type.startsWith('fs.') && !isNoiseFs(e.action?.arguments_redacted?.path)).length;
+  const externals = collectExternals(events).size;
+  const riskCount = alerts.filter(a=>a.rule_id==='R1'||a.rule_id==='R4').length;
+  const cards = [
+    ['指令数', instructions.length, ''],
+    ['工具调用', toolCalls, ''],
+    ['大模型调用', llmCalls, ''],
+    ['文件操作', fileOps, ''],
+    ['外部资源', externals, ''],
+    ['高风险告警', riskCount, 'warn'],
+  ];
+  document.getElementById('stats').innerHTML = cards.map(([l,v,cls])=>
+    `<div class="stat ${cls}"><div class="label">${l}</div><div class="value">${v}</div></div>`).join('');
+}
+
+function getInstructions(events){
+  return events.filter(e => {
+    if(e.event_type !== 'conversation.user') return false;
+    const p = e.action?.arguments_redacted?.preview || '';
+    return !p.startsWith('You are Kiro') && p.trim().length > 0;
+  });
+}
+
+function collectExternals(events){
+  const s = new Set();
+  events.forEach(e => {
+    if(!['net.connect','tool.http'].includes(e.event_type)) return;
+    const ar = e.action?.arguments_redacted || {};
+    const host = ar.host || (ar.peer||'').split(':')[0];
+    if(host && !host.startsWith('127.') && !host.includes('telemetry') && !host.includes('download.kiro')) s.add(host);
+  });
+  return s;
+}
+
+function extractModel(ev){
+  const ar = ev.action?.arguments_redacted || {};
+  const s = JSON.stringify(ar);
+  const m = s.match(/"modelId"\s*:\s*"([^"]+)"/) || s.match(/"model"\s*:\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
+
+function renderTasks(events, alerts){
+  const instructions = getInstructions(events);
+  const sorted = [...events].sort((a,b)=>String(a.timestamp||'').localeCompare(String(b.timestamp||'')));
+  const box = document.getElementById('tasks');
+  if(!instructions.length){
+    box.innerHTML = '<div class="empty">暂无指令记录 — 等用户在 Agent 中发起对话后，这里会按指令展示完整任务过程</div>';
+    return;
+  }
+  // 每个指令一个任务（该指令到下一个指令之间的时间段）
+  const html = instructions.map((ins, i)=>{
+    const t0 = ins.timestamp;
+    const t1 = instructions[i+1]?.timestamp;
+    const evs = sorted.filter(e => e.timestamp && e.timestamp >= t0 && (!t1 || e.timestamp < t1));
+    const models = new Set(); const tools = []; const reads = new Set(); const writes = new Set(); const exts = new Set();
+    evs.forEach(e=>{
+      const ar = e.action?.arguments_redacted || {};
+      if(e.event_type==='llm.request'){ const m=extractModel(e); if(m) models.add(m); }
+      else if(e.event_type==='tool.invoke'){ if(e.action?.name) tools.push(e.action.name); }
+      else if(e.event_type==='fs.read'){ if(!isNoiseFs(ar.path)) reads.add(ar.path); }
+      else if(['fs.write','fs.create'].includes(e.event_type)){ if(!isNoiseFs(ar.path)) writes.add(ar.path); }
+      else if(['net.connect','tool.http'].includes(e.event_type)){ const h=ar.host||(ar.peer||'').split(':')[0]; if(h&&!h.startsWith('127.')&&!h.includes('telemetry')&&!h.includes('download.kiro')) exts.add(h); }
+    });
+    const riskCount = alerts.filter(a => a.timestamp && a.timestamp >= t0 && (!t1 || a.timestamp < t1) && (a.rule_id==='R1'||a.rule_id==='R4')).length;
+    const preview = (ins.action?.arguments_redacted?.preview || '').replace(/\n/g,' ');
+    return `<div class="task">
+      <div class="task-head">
+        <span class="time">${fmtTime(t0)}</span>
+        <span class="instruction">💬 ${esc(preview.slice(0,80))}</span>
+        ${riskCount ? `<span class="risk">⚠️ ${riskCount} 风险</span>` : ''}
+      </div>
+      <div class="task-body">
+        ${models.size ? `<div class="row"><span class="tag">大模型</span><span class="content">${[...models].map(m=>`<span class="chip model">${esc(m)}</span>`).join('')}</span></div>` : ''}
+        ${tools.length ? `<div class="row"><span class="tag">执行操作</span><span class="content">${[...new Set(tools)].map(t=>`<span class="chip tool">🔧 ${esc(t)}</span>`).join('')}</span></div>` : ''}
+        ${reads.size ? `<div class="row"><span class="tag">读取文件</span><span class="content">${[...reads].slice(0,8).map(f=>`<span class="chip read">${esc(f.split('/').slice(-2).join('/'))}</span>`).join('')}</span></div>` : ''}
+        ${writes.size ? `<div class="row"><span class="tag">写入文件</span><span class="content">${[...writes].slice(0,8).map(f=>`<span class="chip file">✍️ ${esc(f.split('/').slice(-2).join('/'))}</span>`).join('')}</span></div>` : ''}
+        ${exts.size ? `<div class="row"><span class="tag">外部资源</span><span class="content">${[...exts].slice(0,10).map(h=>`<span class="chip ext">🌐 ${esc(h)}</span>`).join('')}</span></div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+  box.innerHTML = html;
+}
+
+function renderRisk(alerts){
+  const box = document.getElementById('riskSummary');
+  const risky = alerts.filter(a=>a.rule_id==='R1'||a.rule_id==='R4').slice(0,30);
+  if(!risky.length){ box.style.display='none'; return; }
+  box.style.display='block';
+  box.innerHTML = `<h2>🚨 风险告警（${risky.length} 条）</h2>` +
+    risky.map(a=>`<div class="risk-item"><span class="${a.rule_id==='R1'?'r1':'r4'}">[${a.rule_id}]</span> ${fmtTime(a.timestamp)} — ${esc(a.detail||'').slice(0,120)}</div>`).join('');
+}
+
+load();
+setInterval(load, 5000);
 </script>
 </body>
 </html>
