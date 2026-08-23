@@ -404,7 +404,7 @@ class ServerAgent:
         check_alerts(ev, self.watch_roots, self.alerts_fh)
         if self.report_url:
             self._pending_report.append(json.dumps(ev, ensure_ascii=False))
-            if len(self._pending_report) >= 20:
+            if len(self._pending_report) >= 5:
                 self._flush_report()
         return ev
 
@@ -580,7 +580,7 @@ class ServerAgent:
                    "result_summary": {}})
         self._print(f"◆ trace.begin    server={os.uname().nodename} "
                     f"roots={self.watch_roots}")
-        t_proc = t_net = t_file = t_hb = time.time()
+        t_proc = t_net = t_file = t_hb = t_report = time.time()
         while not self._stop:
             now = time.time()
             try:
@@ -592,6 +592,8 @@ class ServerAgent:
                     self.poll_files(); t_file = now
                 if now - t_hb >= 30:
                     self.heartbeat(); t_hb = now
+                if now - t_report >= 5:
+                    self._flush_report(); t_report = now
             except Exception as e:
                 self._print(f"⚠️ 采集轮询异常（{e}），继续")
                 time.sleep(1)
