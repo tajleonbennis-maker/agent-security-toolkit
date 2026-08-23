@@ -101,10 +101,15 @@ if ! kill -0 $COLLECTOR_PID 2>/dev/null; then
   cleanup_and_exit
 fi
 
-# ---------------- 2. 启动 FSEvents 文件监视器
+# ---------------- 2. 启动 FSEvents 文件监视器（workspace + 敏感目录 + Kiro 数据目录）
 FS_LOG="${ROOT}/events/fs_watcher.log"
-"$PY" "${ROOT}/dashboard/fs_watcher.py" "$WS" \
-  "/Users/jatsmith/Library/Application Support/Kiro/User" >"$FS_LOG" 2>&1 &
+FS_PATHS=("$WS" "/Users/jatsmith/Library/Application Support/Kiro/User")
+# 敏感磁盘空间：Agent 若在这些目录写/删文件，需要被看见
+for _d in "$HOME/Documents" "$HOME/Desktop" "$HOME/Downloads" \
+          "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config"; do
+  [ -d "$_d" ] && FS_PATHS+=("$_d")
+done
+"$PY" "${ROOT}/dashboard/fs_watcher.py" "${FS_PATHS[@]}" >"$FS_LOG" 2>&1 &
 FS_PID=$!
 echo "fs_watcher $FS_PID" >> "$PIDFILE"
 
