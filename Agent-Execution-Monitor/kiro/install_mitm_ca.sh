@@ -9,9 +9,13 @@ set -e
 CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 if [ ! -f "$CA" ]; then
   echo "[ca] 首次生成 CA..."
-  mitmproxy --version >/dev/null 2>&1 || (echo "请先安装 mitmproxy"; exit 1)
-  # 运行一次 mitmproxy 让 CA 生成
-  timeout 3 mitmproxy --mode regular@8080 --quiet 2>/dev/null || true
+  mitmdump --version >/dev/null 2>&1 || (echo "请先安装 mitmproxy (brew install mitmproxy)"; exit 1)
+  # 运行一次 mitmdump 让 CA 自动生成（macOS 无 timeout，用后台+kill 代替）
+  mitmdump --mode regular@8080 --set termlog_verbosity=error >/dev/null 2>&1 &
+  MPID=$!
+  sleep 2
+  kill "$MPID" 2>/dev/null || true
+  wait "$MPID" 2>/dev/null || true
 fi
 
 if [ ! -f "$CA" ]; then
