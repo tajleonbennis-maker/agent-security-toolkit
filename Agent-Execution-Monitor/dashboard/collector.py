@@ -189,8 +189,11 @@ def ingest_event(ev: dict, config: dict):
             pass
 
     ev.setdefault("evidence", {})
-    ev["evidence"]["prev_hash"] = prev
-    ev["evidence"]["hash"] = chain_hash(prev, ev)
+    if not ev["evidence"].get("hash"):
+        # 无 hash 的事件（本地 observer/mitmproxy/fs_watcher）→ 本地续链
+        ev["evidence"]["prev_hash"] = prev
+        ev["evidence"]["hash"] = chain_hash(prev, ev)
+    # 已有 hash 的事件（server/agent.py 上报）→ 保留其原始哈希链，不重算
 
     # 落盘
     _append_to_file(chain_file, [ev])
@@ -221,18 +224,34 @@ def create_app(events_dir: str, fallback_trace_id: str):
 
     @app.route("/ingest", methods=["POST"])
     def ingest():
-        try:
-            payload = request.get_json(force=True, silent=True) or {}
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 400
+        ctype = request.headers.get("Content-Type", "")
+        items = []
+        if "ndjson" in ctype or "x-ndjson" in ctype:
+            # ndjson 批量（server/agent.py 上报格式，多行 JSON）
+            raw = request.get_data(as_text=True)
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        else:
+            try:
+                payload = request.get_json(force=True, silent=True) or {}
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 400
+            # 支持单条或数组
+            items = payload if isinstance(payload, list) else [payload]
 
-        # 支持单条或数组
-        items = payload if isinstance(payload, list) else [payload]
+        n = 0
         for ev in items:
             if not isinstance(ev, dict):
                 continue
             ingest_event(ev, config)
-        return jsonify({"ok": True, "ingested": len(items)})
+            n += 1
+        return jsonify({"ok": True, "ingested": n})
 
     @app.route("/events")
     def events():
