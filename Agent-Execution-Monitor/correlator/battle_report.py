@@ -15,6 +15,7 @@ import os
 import re
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 
 # 时间线关注的事件类型（其余噪声类型跳过）
 KEEP_TYPES = {
@@ -96,6 +97,104 @@ def load(paths):
                 except json.JSONDecodeError:
                     continue
     return events
+
+
+# ---------------- 因果关联引擎 ----------------
+COMMAND_HINTS = {
+    "ssh": ["ssh", "sshd", "sftp-server", "sftp"],
+    "scp": ["scp", "sftp-server", "sftp"],
+    "git": ["git "],
+    "go": ["go ", "monitor", "go build", "golang"],
+    "curl": ["curl", "wget"],
+    "npm": ["npm", "node"],
+    "systemctl": ["systemctl", "systemd"],
+    "docker": ["docker"],
+}
+
+SYS_EVENT_TYPES = {
+    "process.spawn", "process.exit", "net.connect", "net.listen",
+    "ssh.session.open", "ssh.session.close", "fs.read", "fs.write",
+    "fs.create", "fs.delete",
+}
+
+
+def _parse_ts(ts):
+    if not ts:
+        return None
+    ts = ts.strip()
+    try:
+        if ts.endswith("Z"):
+            return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        try:
+            return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%f%z")
+        except Exception:
+            return None
+
+
+def build_causal_chains(events, window_sec=4.0):
+    """把命令类工具调用与其触发的系统事件按「时间窗 + 语义」关联成执行链。"""
+    tools = [e for e in events
+             if e.get("event_type") == "tool.invoke"
+             and e.get("action", {}).get("name") in ("execute_bash", "run_command")]
+    sys_pool = [e for e in events if e.get("event_type") in SYS_EVENT_TYPES]
+
+    # 预解析时间戳
+    tmap = {}
+    def ts_of(e):
+        if id(e) not in tmap:
+            tmap[id(e)] = _parse_ts(e.get("timestamp", ""))
+        return tmap[id(e)]
+
+    chains = []
+    for tool in tools:
+        cmd = (tool.get("action", {}).get("arguments_redacted") or {}).get("command", "")
+        if not cmd:
+            continue
+        t0 = ts_of(tool)
+        if not t0:
+            continue
+        # 语义 hint
+        hints = [k for k, kws in COMMAND_HINTS.items()
+                 if any(kw.lower() in cmd.lower() for kw in kws)]
+        # 时间窗内找关联系统事件（去重 + 排除背景噪声）
+        related = []
+        seen_keys = set()
+        for s in sys_pool:
+            st = ts_of(s)
+            if not st:
+                continue
+            delta = (st - t0).total_seconds()
+            if not (0 <= delta <= window_sec):
+                continue
+            act = s.get("action", {}) or {}
+            key = (s.get("span_id"), s.get("event_type"),
+                   act.get("summary", ""), act.get("arguments_redacted", {}).get("path", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            s_text = json.dumps(act, ensure_ascii=False)
+            # 排除 Kiro 自身背景噪声（走代理、遥测、IDE 配置目录）
+            if s.get("event_type") == "net.connect" and "127.0.0.1" in s_text:
+                continue
+            if "telemetry" in s_text or "Application Support" in s_text:
+                continue
+            related.append((delta, s))
+        # 语义过滤：优先保留与命令关键词匹配的事件；无匹配则仅保留进程类
+        if hints and related:
+            matched = [(d, s) for d, s in related
+                       if any(k in json.dumps(s.get("action", {}), ensure_ascii=False).lower()
+                              for k in hints)]
+            if matched:
+                related = matched
+            else:
+                related = [(d, s) for d, s in related
+                           if s.get("event_type") in ("process.spawn", "process.exit")]
+        if related:
+            related.sort(key=lambda x: x[0])
+            chains.append({"command": cmd, "time": t0, "related": related})
+    return chains
 
 
 def load_alerts(paths):
@@ -206,6 +305,24 @@ def main():
     for a in r1 + r2 + r3:
         det = redact(str(a.get("detail", "")))[:160]
         lines.append(f"- **[{a.get('rule_id')}]** {a.get('timestamp', '')} — {det}")
+    lines.append("")
+
+    # 因果执行链：命令 → 触发的系统事件
+    chains = build_causal_chains(events)
+    lines.append("## 因果执行链（命令 → 系统动作）")
+    lines.append("")
+    if not chains:
+        lines.append("- 无关联")
+    for ch in chains:
+        cmd = redact(ch["command"])[:90]
+        t0 = (ch["time"].astimezone(timezone.utc).strftime("%H:%M:%S")
+              if ch["time"] else "")
+        lines.append(f"- 🔧 `{cmd}`")
+        for delta, s in ch["related"][:6]:
+            et = s.get("event_type", "")
+            sb = brief(s).replace("|", "\\|")[:80]
+            src = SOURCE_TAG.get(s.get("source"), s.get("source", "-"))
+            lines.append(f"    +{delta:.1f}s [{src}] {ICON.get(et, '·')} {sb}")
     lines.append("")
 
     lines.append("## 安全发现小结")
