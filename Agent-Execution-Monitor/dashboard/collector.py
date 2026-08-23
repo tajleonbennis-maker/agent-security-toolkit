@@ -49,6 +49,36 @@ SECRET_CONTENT_PATTERNS = [
 
 ALLOWLIST_HOSTS = {"127.0.0.1", "localhost", "0.0.0.0"}
 
+# 危险命令（工具审计：execute_bash/run_command 命令内容）
+DANGEROUS_COMMAND_PATTERNS = [
+    ("递归删除", re.compile(r"(?i)\brm\s+-[a-z]*[rf][a-z]*[rf][a-z]*\b")),
+    ("管道执行远程脚本", re.compile(r"(?i)\b(curl|wget)\b[^|;&]*\|\s*(ba|z|k|da)?sh\b")),
+    ("危险权限", re.compile(r"(?i)\bchmod\s+(-R\s+)?777\b")),
+    ("磁盘擦除", re.compile(r"(?i)\bdd\s+.*\bof=/dev/")),
+    ("格式化磁盘", re.compile(r"(?i)\bmkfs")),
+    ("递归删除目录", re.compile(r"(?i)\brmdir\s+/s\b")),
+    ("覆盖系统文件", re.compile(r"(?i)\b(sudo\s+)?(echo|cat|tee)\b.*>\s*/etc/")),
+]
+
+# 数据外泄检测（llm.request 请求体里出现的敏感路径/内容）
+SENSITIVE_EXFIL_PATTERNS = [
+    ("SSH密钥路径", re.compile(r"\.ssh/|id_rsa|id_ed25519|authorized_keys")),
+    ("git凭证", re.compile(r"\.gitconfig|\.git-credentials")),
+    ("云凭证路径", re.compile(r"\.aws/|\.gnupg/|\.config/gcloud|\.kube/")),
+    ("环境变量文件", re.compile(r"\.env\b")),
+    ("私钥内容", re.compile(r"BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY")),
+    ("密码管理器", re.compile(r"\.netrc|Keychains|keychain")),
+]
+
+# 越界文件读取（read_file 读敏感文件）
+SENSITIVE_READ_PATHS = [
+    ("SSH密钥", re.compile(r"\.ssh/")),
+    ("git凭证", re.compile(r"\.gitconfig|\.git-credentials")),
+    ("云凭证", re.compile(r"\.aws/|\.gnupg/")),
+    ("系统账号", re.compile(r"/etc/(passwd|shadow|sudoers)")),
+    ("环境变量", re.compile(r"\.env\b")),
+]
+
 
 def chain_hash(prev_hash: str, event: dict) -> str:
     """与 runtime/trace.py 保持一致的哈希算法。"""
@@ -158,6 +188,58 @@ def _classify_alert(ev: dict) -> list:
                 "detail": f"越界文件操作: {path}",
                 "event": ev,
             })
+
+    # R4: 危险命令（工具审计：execute_bash/run_command 含危险操作）
+    if et == "tool.invoke":
+        cmd = args.get("command", "") if isinstance(args, dict) else ""
+        if cmd:
+            for name, pat in DANGEROUS_COMMAND_PATTERNS:
+                if pat.search(cmd):
+                    alerts.append({
+                        "rule_id": "R4",
+                        "rule_name": "危险命令",
+                        "severity": "high",
+                        "timestamp": ev.get("timestamp"),
+                        "trace_id": ev.get("trace_id"),
+                        "span_id": ev.get("span_id"),
+                        "detail": f"危险命令（{name}）：{cmd[:120]}",
+                        "event": ev,
+                    })
+                    break
+
+    # 越界读取敏感文件（工具审计：read_file/grep_search 读敏感文件）
+    if et == "tool.invoke":
+        path = args.get("path", "") if isinstance(args, dict) else ""
+        if path:
+            for name, pat in SENSITIVE_READ_PATHS:
+                if pat.search(path):
+                    alerts.append({
+                        "rule_id": "R1",
+                        "rule_name": "敏感文件读取",
+                        "severity": "high",
+                        "timestamp": ev.get("timestamp"),
+                        "trace_id": ev.get("trace_id"),
+                        "span_id": ev.get("span_id"),
+                        "detail": f"读取敏感文件（{name}）：{path[:120]}",
+                        "event": ev,
+                    })
+                    break
+
+    # 数据外泄检测（llm.request 请求体含敏感路径/内容）
+    if et == "llm.request":
+        for name, pat in SENSITIVE_EXFIL_PATTERNS:
+            if pat.search(text):
+                alerts.append({
+                    "rule_id": "R1",
+                    "rule_name": "数据外泄",
+                    "severity": "high",
+                    "timestamp": ev.get("timestamp"),
+                    "trace_id": ev.get("trace_id"),
+                    "span_id": ev.get("span_id"),
+                    "detail": f"请求体含敏感信息（{name}）→ 可能外泄给大模型",
+                    "event": ev,
+                })
+                break
 
     return alerts
 
