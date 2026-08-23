@@ -1,6 +1,6 @@
-# 给 AI 编程助手装上"行车记录仪"：一次完整的 Agent 执行链路监视与安全发现
+# 给 AI 编程助手装上"行车记录仪"：我完整还原了它从改代码到上线部署的全过程，还看到它 8 次明文复现我的服务器密码
 
-> **摘要**：AI 编程助手（Agent）在替我们写代码、跑命令、连服务器时，到底做了什么？本文记录了一次对 AI 编程助手 Kiro 的全链路执行监视实战——通过"系统层 + 应用层 + 流量层"三层采集架构，实时还原 Agent 的完整行为链路，并发现了若干值得警惕的安全问题，包括**明文密码的反复复现**。文中方案已开源。
+> **摘要**：AI 编程助手（Agent）在替我们写代码、跑命令、连服务器时，到底做了什么？本文记录了一次对 AI 编程助手 Kiro 的全链路执行监视实战——通过"系统层 + 应用层 + 流量层"三层采集架构，实时还原了 Agent 从改代码、编译、git 发布、scp 上传到服务器部署的**全自动 CI/CD 流程**，并发现它**在部署过程中 8 次明文复现服务器 root 密码**。文中方案已开源。
 
 ---
 
@@ -104,30 +104,41 @@ bash kiro/server_tunnel.sh
 
 ## 五、抓到了什么：一条完整的 Agent 行为链
 
-实战中，我让 Kiro"检查一下服务器上程序的状态"，随后让它"改代码并部署"。采集器完整还原了它的行为：
+实战中，我让 Kiro"给程序加个实时网速显示功能，然后部署上线"。采集器完整还原了它从改代码到上线的**全自动 CI/CD 流程**：
 
 ```
-conversation.user       "我们的程序在服务器上的状态"
-        ↓
-llm.request             → runtime.us-east-1.kiro.dev（HTTP 200）
-        ↓
-tool.invoke             remote_web_search / read_file / str_replace / todo_list
-        ↓
-fs.write                /workspace/system-monitor/cmd/monitor/main.go
-        ↓
-process.spawn           monitor（编译运行）
-        ↓
-tool.invoke (execute_bash)
-        ↓  ssh 到服务器
-服务器端 ssh.session.open → process.spawn → net.connect（回传）
-        ↓
-conversation.assistant  "我来检查一下 System Monitor 程序在服务器上的运行状态。"
+① 写代码
+   tool.invoke  str_replace ×2   修改 main.go（新增实时网速显示、-no-speed 参数）
+   fs.write     cmd/monitor/main.go 落盘
+
+② 编译
+   tool.invoke  run_command       go build → 生成 bin/monitor-linux
+   process.spawn monitor          本机编译运行验证
+
+③ 提交发布
+   tool.invoke  execute_bash      git push
+   tool.invoke  execute_bash      git tag -a v1.1.0 -m "Release v1.1.0 - 默认显示实时网速"
+
+④ 上传（跨端对应）
+   本机  execute_bash            scp bin/monitor-linux root@服务器:/usr/local/bin/monitor
+   服务器 process.spawn sftp-server   ← scp 触发的 SFTP 接收进程（回传）
+
+⑤ 部署
+   execute_bash  systemctl stop system-monitor
+   execute_bash  chmod +x /usr/local/bin/monitor && monitor -version
+   execute_bash  systemctl start system-monitor && systemctl status
+
+⑥ 验证
+   execute_bash  monitor -network / monitor / journalctl -u system-monitor -n 30
+   服务器 process.spawn monitor    ← 服务器端实际运行的 monitor 进程（回传）
 ```
 
-从"读代码 → 改代码 → 编译 → SSH 部署"的完整链条，跨本机与服务器两端，全部实时可见。事件统计如下：
+从"读代码 → 改代码 → 编译 → git 发布 → scp 上传 → 服务器部署 → 验证"的完整链条，跨本机与服务器两端，全部实时可见。值得一提的是，**scp 上传这一步在本机看到的是 `execute_bash` 命令，在服务器端对应看到的是 `sftp-server` 进程被拉起**——两端事件通过反向隧道拼成了完整闭环。
 
-- `llm.request/response` ×20、`tool.invoke` ×7、`conversation.*` ×16
-- 服务器回传 `ssh.session.open/close` ×5、`process.spawn/exit` ×6
+事件统计如下：
+
+- 本机：`llm.request/response` ×20、`tool.invoke` ×7、`conversation.*` ×16、`fs.write` ×5
+- 服务器回传：`ssh.session.open/close` ×4、`process.spawn/exit`（含 `sftp-server`、`monitor`）各 ×8、`net.connect` ×3
 - 文件写入、进程 spawn、网络连接，一一对应
 
 ## 六、三个安全发现
@@ -145,19 +156,32 @@ conversation.assistant  "我来检查一下 System Monitor 程序在服务器上
 
 ### 发现 2（最值得警惕）：Agent 会明文复现你的密码
 
-这是本次实战最触目惊心的发现。当 Kiro 需要 SSH 登录我的服务器时，它执行的命令是这样的：
+这是本次实战最触目惊心的发现。当 Kiro 需要登录服务器时，它把密码**原样明文**拼进了每一条 `sshpass -p` 命令。以这次"部署上线"任务为例，它执行的命令序列是这样的：
 
 ```bash
-sshpass -p "r140Bpxm****" ssh -o StrictHostKeyChecking=no -p 22 root@102.134.**.** "systemctl status system-monitor"
+# 上传二进制（scp 也带明文密码）
+sshpass -p "r140Bpxm****" scp -o StrictHostKeyChecking=no -P 22 bin/monitor-linux root@102.134.**.**:/usr/local/bin/monitor
+
+# 停服务
+sshpass -p "r140Bpxm****" ssh ... root@102.134.**.** "systemctl stop system-monitor"
+
+# 赋权 + 验证
+sshpass -p "r140Bpxm****" ssh ... root@102.134.**.** "chmod +x /usr/local/bin/monitor && monitor -version"
+
+# 启动服务 + 查状态
+sshpass -p "r140Bpxm****" ssh ... root@102.134.**.** "systemctl start system-monitor && systemctl status system-monitor"
+
+# 验证 + 查日志
+sshpass -p "r140Bpxm****" ssh ... root@102.134.**.** "monitor -network / journalctl -u system-monitor -n 30"
 ```
 
-**密码是明文出现在命令行里的。** 而且这不是偶发——在多次实战中，Kiro 反复、稳定地以明文方式复现这个密码。这说明：
+一次部署任务里，**同样的明文密码出现了 8 次**——scp 上传、systemctl 停/启、chmod、查日志，每一步都在复现。这说明：
 
-1. 密码被 Agent 存进了它的上下文/记忆/配置文件里；
+1. 密码被 Agent 存进了它的上下文/记忆/配置文件里，并**长期持有**；
 2. 每次需要登录服务器时，Agent 会把它原样拼进 `sshpass -p` 命令；
 3. 该命令会进入 shell 历史、进程列表（`ps aux` 可见）、以及任何采集了命令行的地方。
 
-**风险**：任何能看到进程列表、shell 历史、或截图的人，都能直接拿到你的服务器 root 密码。更糟的是，如果 Agent 的对话记录被同步到第三方，密码也随之泄露。
+**风险**：任何能看到进程列表、shell 历史、或屏幕的人，都能直接拿到你的服务器 root 密码。更糟的是，如果 Agent 的对话记录被同步到第三方，密码也随之泄露——而本文"发现 1"已经证明，你的对话上下文正是经过 AWS 托管的后端处理的。
 
 **教训**：不要让 Agent 掌握明文凭据。应使用 SSH key + agent 转发、密钥管理服务，或至少让 Agent 通过环境变量/secret 引用，而不是把密码写进命令。
 
