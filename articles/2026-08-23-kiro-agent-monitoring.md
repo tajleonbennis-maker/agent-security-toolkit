@@ -210,7 +210,7 @@ sshpass -p "r140Bpxm****" ssh ... root@102.134.**.** "monitor -network / journal
 后续计划：
 
 - 增加**明文密码/密钥实时告警**规则（工具调用命令内容嗅探，命中即弹红）；
-- 接入 eBPF / auditd，覆盖短命进程与内核级事件，消除轮询盲区；
+- ~~接入 eBPF / auditd~~ **（已实现）**：服务器端新增 `ebpf_tracer`，基于 BCC 在内核态挂 `sched_process_exec` + `sys_enter_connect` 两个 tracepoint，零漏采短命进程与连接（`/proc` 轮询会漏掉的 `<0.5s` 进程/连接），已实测回传面板；
 - 支持更多 Agent（Cursor / CodeBuddy / Trae）的私有协议解析；
 - 关联引擎产出完整时间轴与证据包，一键生成事件报告。
 
