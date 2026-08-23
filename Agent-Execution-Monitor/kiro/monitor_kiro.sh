@@ -53,6 +53,7 @@ if [ "${1:-}" = "--stop" ]; then
   pkill -f "kiro/observer.py" 2>/dev/null || true
   pkill -f "kiro/watchdog.sh" 2>/dev/null || true
   pkill -f "mitm_addon.py" 2>/dev/null || true
+  pkill -f "mitmdump" 2>/dev/null || true
   echo "[stack] 已停止"
   exit 0
 fi
@@ -114,14 +115,25 @@ if [ "$ENABLE_MITM" = "1" ]; then
     ENABLE_MITM=0
   else
     MITM_LOG="${ROOT}/events/mitmproxy.log"
-    # 仅拦截 Kiro 进程：用 owner 过滤需要 root；这里用透明或普通代理
-    # 产品化推荐：系统代理 + PAC 让 Kiro 走 127.0.0.1:8080
-    mitmproxy --mode regular@8080 --scripts "${ROOT}/dashboard/mitm_addon.py" \
+    # 上游：Kiro 依赖 V2rayU(127.0.0.1:1087) 访问海外 LLM API。切系统代理到
+    # mitmproxy 后，mitmproxy 必须把上游再指向 V2rayU，否则 Kiro 会断网。
+    # 用 MITM_UPSTREAM 环境变量可覆盖（如 MITM_UPSTREAM=http://127.0.0.1:1087）。
+    MITM_UPSTREAM="${MITM_UPSTREAM:-http://127.0.0.1:1087}"
+    UPSTREAM_PORT="${MITM_UPSTREAM##*:}"
+    if lsof -nP -iTCP:"$UPSTREAM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      MODE="upstream:${MITM_UPSTREAM}@8080"
+      echo "[stack] 检测到上游代理在端口 $UPSTREAM_PORT，mitmproxy 走 upstream 模式"
+    else
+      MODE="regular@8080"
+      echo "[stack] 未检测到上游代理($UPSTREAM_PORT)，mitmproxy 走直连模式（仅适合国内 API）"
+    fi
+    # 用 headless 的 mitmdump（交互式 mitmproxy 无 tty 会崩）
+    mitmdump --mode "$MODE" --scripts "${ROOT}/dashboard/mitm_addon.py" \
       --set termlog_verbosity=warn >"$MITM_LOG" 2>&1 &
     MITM_PID=$!
-    echo "mitmproxy $MITM_PID" >> "$PIDFILE"
+    echo "mitmdump $MITM_PID" >> "$PIDFILE"
     echo "[stack] MITM 代理已启动: http://127.0.0.1:8080"
-    echo "        请把 Kiro 的系统代理设为 127.0.0.1:8080（或安装透明代理）"
+    echo "        切换 Kiro 系统代理：bash kiro/proxy_setup.sh on"
   fi
 fi
 
