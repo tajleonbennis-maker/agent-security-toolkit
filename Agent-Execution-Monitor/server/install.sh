@@ -32,7 +32,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 $REMOTE_DIR/agent.py --watch /opt,/srv,/root,/var/www,/home
+ExecStart=/usr/bin/python3 $REMOTE_DIR/agent.py --watch /opt,/srv,/root,/var/www,/home --poll-proc 0.25 --poll-net 0.5 --poll-file 5
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
