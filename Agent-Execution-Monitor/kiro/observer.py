@@ -37,6 +37,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -287,12 +289,15 @@ class RealtimeAlerts:
 # ---------------------------------------------------------------- 观察器
 class KiroObserver:
     def __init__(self, workspace, events_dir, poll_proc, poll_net, poll_file,
-                 seed_pid=None, seed_pattern=None, resume=None, agent_name="Kiro"):
+                 seed_pid=None, seed_pattern=None, resume=None, agent_name="Kiro",
+                 collector_url=None, capture_reads=False):
         self.workspace = os.path.realpath(os.path.expanduser(workspace))
         self.poll_proc, self.poll_net, self.poll_file = poll_proc, poll_net, poll_file
         self.seed_pid = seed_pid
         self.seed_pattern = seed_pattern or KIRO_APP_PREFIX
         self.agent_name = agent_name
+        self.collector_url = collector_url
+        self.capture_reads = capture_reads
         self.stop_file = os.path.join(events_dir, "STOP")
         # 断点续写：沿用旧 trace_id + 从最后一事件恢复哈希链
         if resume:
@@ -314,6 +319,8 @@ class KiroObserver:
         self.start_time = time.time()
         self.resumed = bool(resume)
         self._stop_requested = False
+        self.seen_fds = set()          # (pid,path) 已上报的文件读取，去重
+
 
     def _restore_chain(self, events_dir):
         path = os.path.join(events_dir, f"{self.trace_id}.ndjson")
@@ -331,7 +338,7 @@ class KiroObserver:
             self.writer.prev_hash = last.get("evidence", {}).get("hash", "GENESIS")
             self.writer.count = sum(1 for _ in open(path, encoding="utf-8"))
 
-    # ---- 事件发射（含实时告警） ----
+    # ---- 事件发射（含实时告警 + collector 广播） ----
     def emit(self, span, parent, etype, actor, action):
         ev = self.writer.build(
             source="kiro_observer", event_type=etype,
@@ -342,7 +349,24 @@ class KiroObserver:
         self.writer.emit(ev)
         self.counts[etype] = self.counts.get(etype, 0) + 1
         self.alerts.check(ev)          # 实时告警：进程死了告警也在磁盘
+        self._post_collector(ev)
         return ev
+
+    def _post_collector(self, ev):
+        if not self.collector_url:
+            return
+        try:
+            data = json.dumps(ev, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                self.collector_url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            # 网络抖动不致命，静默降级
+            pass
 
     def proc_span(self, pid, argv):
         if pid not in self.pid_spans:
@@ -444,6 +468,8 @@ class KiroObserver:
             self._print(f"🌐 net.connect   pid{pid} {local} → {ph}:{pp}  [{note}]")
 
     def poll_files(self):
+        if self.capture_reads:
+            self._poll_file_reads()
         cur = scan_files(self.workspace, DEFAULT_EXCLUDE)
         if self.file_baseline is None:
             self.file_baseline = cur
@@ -474,6 +500,63 @@ class KiroObserver:
                            "result_summary": {}})
                 self._print(f"🗑️ fs.delete     {rel}")
         self.file_baseline = cur
+
+    # ---------------------------------------------------------------- 文件读取捕获
+    SENSITIVE_READ_PATTERNS = [
+        ".ssh/", ".gnupg/", ".aws/", ".gitconfig", ".git-credentials",
+        ".netrc", "Keychains", ".npmrc", ".pypirc", ".docker/config.json",
+        ".kube/config", ".env", ".bash_history", ".zsh_history",
+        ".bashrc", ".zshrc", ".profile", ".zprofile", ".bash_profile",
+        ".claude.json", ".git-credentials", ".dockerignore", ".p10k.zsh",
+    ]
+
+    def _is_sensitive_read(self, path):
+        """判定一个已打开文件路径是否值得上报为 fs.read。
+
+        只报已知敏感模式，避免把 .DS_Store 等噪音全报上来。
+        """
+        p = path.lower()
+        for pat in self.SENSITIVE_READ_PATTERNS:
+            if pat.lower() in p:
+                return True
+        return False
+
+    def _poll_file_reads(self):
+        """通过 lsof 文件描述符扫描捕获进程打开的文件（重点：敏感读取）。"""
+        for pid in self.current_tree:
+            try:
+                r = subprocess.run(["lsof", "-a", "-p", str(pid), "-F", "fn"],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode != 0:
+                    continue
+                cur_fd = None
+                for line in r.stdout.splitlines():
+                    if line.startswith("f"):
+                        cur_fd = line[1:]
+                    elif line.startswith("n") and cur_fd:
+                        path = line[1:]
+                        key = (pid, path)
+                        if key in self.seen_fds:
+                            cur_fd = None
+                            continue
+                        # lsof FD 列：cwd/txt/rtd/mem 等表示打开；'r' 读模式，'u' 读写
+                        # 这里只要有路径即认为已打开，再做敏感过滤避免噪音
+                        if self._is_sensitive_read(path):
+                            self.seen_fds.add(key)
+                            span = self.pid_spans.get(pid) or self.proc_span(
+                                pid, self.seen_pids.get(pid, ""))
+                            self.emit(span, self.session_span, "fs.read",
+                                      {"type": "process", "pid": pid},
+                                      {"name": "read",
+                                       "arguments_redacted": {
+                                           "path": path,
+                                           "fd": cur_fd,
+                                           "sensitive": True},
+                                       "result_summary": {}})
+                            self._print(f"📖 fs.read       pid{pid} {path}")
+                        cur_fd = None
+            except Exception:
+                pass
 
     def heartbeat(self):
         self.emit(self.session_span, None, "session.heartbeat",
@@ -594,6 +677,10 @@ def main():
     ap.add_argument("--agent-name", default="Kiro")
     ap.add_argument("--resume", default=None,
                     help="续写的 trace_id：沿用哈希链继续记录同一会话")
+    ap.add_argument("--collector", default=None,
+                    help="实时面板收集器 URL，例如 http://127.0.0.1:8787/ingest")
+    ap.add_argument("--capture-reads", action="store_true",
+                    help="启用 lsof 文件描述符扫描，捕获敏感文件读取（fs.read）")
     args = ap.parse_args()
 
     if not os.path.isdir(args.workspace):
@@ -604,7 +691,9 @@ def main():
                        args.poll_proc, args.poll_net, args.poll_file,
                        seed_pid=args.seed_pid,
                        seed_pattern=args.seed_pattern,
-                       resume=args.resume, agent_name=args.agent_name)
+                       resume=args.resume, agent_name=args.agent_name,
+                       collector_url=args.collector,
+                       capture_reads=args.capture_reads)
     obs.run(args.duration or None)
     sys.exit(GRACEFUL_EXIT_CODE if obs._stop_requested else 0)
 

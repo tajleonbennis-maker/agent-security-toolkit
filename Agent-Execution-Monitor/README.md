@@ -110,14 +110,27 @@ Kibana 中按 `trace.id` 过滤即可看到一次任务的完整执行链。
 纯系统事实观测：进程树（含终端孙进程）/ TCP 外联 / workspace 文件增删改 +
 实时告警（含文件内容密钥嗅探——明文密码/私钥落盘瞬间报警）。
 
-产品化长期运行（watchdog/launchd 守护 + 断链续写）与**服务器侧采集**
-（Kiro SSH 部署到远端主机后的动作监控）见
-[docs/production.md](docs/production.md)。
+v3 进一步补上了**应用层透视**：MITM 代理捕获 Kiro 的 HTTPS 工具调用、LLM 请求、
+用户-Kiro 对话；FSEvents + lsof 捕获文件读取（如 Kiro 读 `~/.gitconfig` 拿 git 账号）；
+所有事件汇入 `dashboard/collector.py` 实时面板。
 
 ```bash
-bash kiro/monitor_kiro.sh /path/to/kiro打开的项目   # 守护模式
-bash server/install.sh root@<被部署服务器>           # 服务器侧视野
+# 一键启动完整采集栈（含实时面板、FSEvents、observer 守护）
+bash kiro/monitor_kiro.sh /path/to/kiro打开的项目 --capture-reads
+
+# 需要看清工具调用/对话/对端域名时，加 --mitm（需先安装 CA、开代理）
+bash kiro/install_mitm_ca.sh
+bash kiro/proxy_setup.sh on
+bash kiro/monitor_kiro.sh /path/to/kiro打开的项目 --capture-reads --mitm
+
+# 服务器侧视野（Kiro SSH 部署到远端主机后的动作）
+bash server/install.sh root@<被部署服务器>
 ```
+
+详细部署、MITM 配置、launchd 产品化见
+[docs/production.md](docs/production.md)。
+
+打开面板后访问：`http://127.0.0.1:8787`
 
 ## 目录结构
 
@@ -126,7 +139,8 @@ runtime/     Agent 模拟运行时 + 工具网关 + 传感器（事件发射层�
 tasks/       演示任务定义（JSON，可插拔到真实 LLM Runtime）
 beats/       Filebeat/Packetbeat 配置 + ES ingest pipeline（采集层）
 correlator/  Span 树重建、时间轴、规则引擎、流量关联、证据包（关联层）
-kiro/        被动观察器 v2 + watchdog + launchd 产品化部署
+kiro/        被动观察器 v3 + watchdog + launchd + MITM/代理脚本
+dashboard/   实时面板 (collector) + FSEvents 文件监视 + mitmproxy addon
 server/      服务器端采集器 + 一键部署 + 中央汇集器
 demo/        端到端演示脚本
 docs/        架构文档 + 产品化部署指南

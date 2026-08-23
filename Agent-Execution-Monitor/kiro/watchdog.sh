@@ -7,7 +7,7 @@
 #   3. 优雅停止：observer 退出码 42（STOP 哨兵 / SIGTERM）→ watchdog 也退出
 #
 # 用法：
-#   bash kiro/watchdog.sh <workspace> [trace_id]
+#   bash kiro/watchdog.sh <workspace> [trace_id] [-- extra observer args ...]
 #   停止：touch events/STOP          （观察器收尾出报告，watchdog 退出）
 #         kill -TERM <watchdog_pid>  （透传给观察器，同样优雅收尾）
 #
@@ -16,8 +16,12 @@
 # 兼容 macOS 自带 bash 3.2：不用 set -u 空数组展开
 set -o pipefail
 
-WS="${1:?用法: watchdog.sh <workspace> [trace_id]}"
+WS="${1:?用法: watchdog.sh <workspace> [trace_id] [-- extra observer args]}"
 TRACE_ID="${2:-}"
+shift; shift || true
+# 如果用户用了 -- 分隔符，去掉它
+[ "${1:-}" = "--" ] && shift
+EXTRA_ARGS=("$@")
 PYTHON_BIN="${PYTHON:-$(command -v python3 || echo python3)}"
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,9 +51,9 @@ restarts=0
 while true; do
   # 若给了 trace_id 就续写；否则首轮记录新会话 id 供人查询
   if [ -n "$TRACE_ID" ]; then
-    "$PYTHON_BIN" "$DIR/kiro/observer.py" --workspace "$WS" --resume "$TRACE_ID" &
+    "$PYTHON_BIN" "$DIR/kiro/observer.py" --workspace "$WS" --resume "$TRACE_ID" "${EXTRA_ARGS[@]}" &
   else
-    "$PYTHON_BIN" "$DIR/kiro/observer.py" --workspace "$WS" &
+    "$PYTHON_BIN" "$DIR/kiro/observer.py" --workspace "$WS" "${EXTRA_ARGS[@]}" &
   fi
   OBSERVER_PID=$!
   if [ -z "$TRACE_ID" ]; then
