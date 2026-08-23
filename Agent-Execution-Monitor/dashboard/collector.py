@@ -101,32 +101,46 @@ def _classify_alert(ev: dict) -> list:
     et = ev.get("event_type", "")
     args = ev.get("action", {}).get("arguments_redacted", {})
 
-    # R1: 内容/参数含密钥
+    # R1: 内容/参数含密钥（重点：明文密码命令，脱敏显示）
     text = json.dumps(args, ensure_ascii=False)
     for name, pat in SECRET_CONTENT_PATTERNS:
         if pat.search(text):
+            detail = f"实时嗅探到疑似密钥（{name}）"
+            # 工具调用命令 → 显示工具名 + 脱敏后的命令，让告警可定位
+            if et == "tool.invoke":
+                tool_name = ev.get("action", {}).get("name", "")
+                cmd = args.get("command", "") if isinstance(args, dict) else ""
+                if cmd:
+                    redacted = re.sub(
+                        r'(-p\s+["\']?)[^"\'\s]+', r'\1[REDACTED]', cmd, flags=re.I)
+                    redacted = re.sub(
+                        r'(password|passwd|pwd|secret|token)\s*[:=]\s*["\']?[^\s"\']+',
+                        r'\1=[REDACTED]', redacted, flags=re.I)
+                    detail = (f"明文密码命令（{name}）：{tool_name} → "
+                              f"{redacted[:140]}")
             alerts.append({
                 "rule_id": "R1",
                 "severity": "high",
                 "timestamp": ev.get("timestamp"),
                 "trace_id": ev.get("trace_id"),
                 "span_id": ev.get("span_id"),
-                "detail": f"实时嗅探到疑似密钥（{name}）",
+                "detail": detail,
                 "event": ev,
             })
             break
 
-    # R3: 异常外联（直连非白名单且无域名说明）
-    if et in ("net.connect", "tool.http"):
-        host = args.get("host") or args.get("peer", "").rsplit(":", 1)[0]
-        if host and host not in ALLOWLIST_HOSTS and not host.startswith("127."):
+    # R3: 异常外联（绕过代理直连公网，peer_kind=direct）
+    if et == "net.connect":
+        peer_kind = args.get("peer_kind", "")
+        peer = args.get("peer", "")
+        if peer_kind == "direct":
             alerts.append({
                 "rule_id": "R3",
                 "severity": "medium",
                 "timestamp": ev.get("timestamp"),
                 "trace_id": ev.get("trace_id"),
                 "span_id": ev.get("span_id"),
-                "detail": f"异常外联: {host}",
+                "detail": f"异常外联(绕过代理): {peer}",
                 "event": ev,
             })
 
