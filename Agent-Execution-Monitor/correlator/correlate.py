@@ -83,7 +83,7 @@ def render_tree(events: list, alerts: list) -> str:
         a = ev.get("action") or {}
         name = a.get("name", "")
         arg = (a.get("arguments_redacted") or {})
-        brief = arg.get("command") or arg.get("path") or arg.get("peer") or ""
+        brief = (arg.get("command") or arg.get("path") or arg.get("peer") or "")[:80]
         rs = a.get("result_summary") or {}
         outcome = rs.get("exit_code", "")
         pol = (ev.get("policy") or {}).get("decision", "")
@@ -249,8 +249,12 @@ def main():
         "## 告警详情",
     ]
     for a in alerts:
-        md.append(f"- **[{a['rule_id']} {a['rule_name']}]** {a['timestamp']} "
-                  f"span=`{a['span_id'][:18]}` — {a['detail']}")
+        rn = a.get("rule_name") or a.get("rule_id", "")
+        ts = a.get("timestamp") or ""
+        sp = a.get("span_id") or ""
+        det = a.get("detail", "")
+        md.append(f"- **[{a.get('rule_id', '')} {rn}]** {ts} "
+                  f"span=`{sp[:18]}` — {det}")
     if not alerts:
         md.append("- 无")
     open(os.path.join(args.out, "timeline.md"), "w", encoding="utf-8").write("\n".join(md))
